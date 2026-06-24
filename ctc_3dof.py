@@ -44,6 +44,7 @@ class CTC3Model:
     torque_scale: float = 1.0
 
 
+
 def _as_3(seq: Sequence[float], name: str) -> tuple[float, float, float]:
     if len(seq) != 3:
         raise ValueError(f"{name} must have length 3")
@@ -142,7 +143,7 @@ def _gravity_vector(model: CTC3Model, q: tuple[float, float, float]) -> tuple[fl
     return G1, G2, G3
 
 
-def ctc_3dof(
+def ctc_3dof_components(
     qd: Sequence[float],
     q: Sequence[float],
     qd_dot: Sequence[float],
@@ -150,8 +151,10 @@ def ctc_3dof(
     qd_ddot: Sequence[float],
     gains: CTC3Gains,
     model: CTC3Model,
-) -> tuple[float, float, float]:
-    """Return 3 torque commands using coupled 3-DOF CTC."""
+    startup_t: float = 0.0,
+    smooth_startup: bool = True,
+    startup_duration: float = 0.8,
+) -> dict[str, tuple[float, float, float]]:
     qd = _as_3(qd, "qd")
     q = _as_3(q, "q")
     qd_dot = _as_3(qd_dot, "qd_dot")
@@ -160,20 +163,74 @@ def ctc_3dof(
 
     e = tuple(qd[i] - q[i] for i in range(3))
     de = tuple(qd_dot[i] - q_dot[i] for i in range(3))
-    v = tuple(qd_ddot[i] + gains.kd[i] * de[i] + gains.kp[i] * e[i] for i in range(3))
+    p_term = tuple(gains.kp[i] * e[i] for i in range(3))
+    d_term = tuple(gains.kd[i] * de[i] for i in range(3))
+    v = tuple(qd_ddot[i] + d_term[i] + p_term[i] for i in range(3))
 
     M = _mass_matrix(model, q)
     C = _coriolis_matrix(model, q, q_dot)
     G = _gravity_vector(model, q)
 
+    # ── Smooth-startup blend: ramp torque from hold-at-start to full CTC over ~0.8s ──
+    # At t=0: w=0 → gravity balance only (prevents sag); at t>=dur: w=1 → full CTC.
+    # G_hold: gravity term at the hold (current) pose, used as the smooth-start baseline.
+    # G_ff:   gravity term at the desired pose, the steady-state gravity feedforward.
+    # The startup term is G_hold · (1−w) + G_ff · w, blended so G_hold ≈ G_ff when
+    # the desired pose is the same as the current pose (no jerk when re-running the same target).
+    if smooth_startup and startup_duration > 0:
+        w = max(0.0, min(1.0, startup_t / startup_duration))
+    else:
+        w = 1.0
+
+    q_hold = _as_3(q, "q_hold")
+    G_hold = _gravity_vector(model, q_hold)
+
+    mv = [0.0, 0.0, 0.0]
+    cv = [0.0, 0.0, 0.0]
     tau: list[float] = []
     for i in range(3):
-        tau_i = 0.0
         for j in range(3):
-            tau_i += M[i][j] * v[j]
-            tau_i += C[i][j] * q_dot[j]
-        tau_i += G[i]
+            mv[i] += M[i][j] * v[j]
+            cv[i] += C[i][j] * q_dot[j]
+        # Smooth-start blend: G_start → G_ff (linear ramp over startup_duration)
+        G_start_i = G_hold[i]
+        G_smooth_i = G_start_i * (1.0 - w) +  G[i] * w
+        tau_i = mv[i] + cv[i] + G_smooth_i
         tau_i += model.viscous_friction[i] * q_dot[i]
         tau_i += model.coulomb_friction[i] * _sign(q_dot[i])
         tau.append(tau_i * model.torque_scale)
-    return tuple(tau)
+
+    return {
+        "e": e,
+        "de": de,
+        "p_term": p_term,
+        "d_term": d_term,
+        "v": v,
+        "mv": tuple(mv),
+        "cv": tuple(cv),
+        "g": G,
+        "g_hold": G_hold,
+        "g_ff": G,
+        "startup_w": w,
+        "friction": tuple(
+            model.viscous_friction[i] * q_dot[i] + model.coulomb_friction[i] * _sign(q_dot[i])
+            for i in range(3)
+        ),
+        "tau": tuple(tau),
+    }
+
+
+def ctc_3dof(
+    qd: Sequence[float],
+    q: Sequence[float],
+    qd_dot: Sequence[float],
+    q_dot: Sequence[float],
+    qd_ddot: Sequence[float],
+    gains: CTC3Gains,
+    model: CTC3Model,
+    startup_t: float = 0.0,
+    smooth_startup: bool = True,
+    startup_duration: float = 0.8,
+) -> tuple[float, float, float]:
+    """Return 3 torque commands using coupled 3-DOF CTC."""
+    return ctc_3dof_components(qd, q, qd_dot, q_dot, qd_ddot, gains, model, startup_t, smooth_startup, startup_duration)["tau"]
