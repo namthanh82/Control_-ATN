@@ -5,8 +5,8 @@ import math
 class TrajectoryBase(ABC):
     def __init__(self):
         # Khởi tạo các biến lưu trữ tham số đã tính toán
-        self.start_p = -90.0
-        self.end_p = -90.0
+        self.start_p = 0.0
+        self.end_p = -180.0
         self.maxVel = math.inf
         self.direction = 1.0
         self.total_time = math.inf
@@ -29,8 +29,8 @@ class TrajectoryBase(ABC):
         pass
 
     def reset(self):
-        self.start_p = -90.0
-        self.end_p = -90.0
+        self.start_p = 0.0
+        self.end_p = -180.0
         self.total_time = math.inf
         self.direction = 1.0
 
@@ -235,8 +235,8 @@ class SplineTrajectory(TrajectoryBase):
     def __init__(self):
         super().__init__()
         # Các tham số cho quỹ đạo splines 7 đoạn với giới hạn jerk
-        self.max_jerk = 40 # deg/s^3
-        self.max_acc = 20  # deg/s^2
+        self.max_jerk = 10 # deg/s^3
+        self.max_acc = 5  # deg/s^2
         self.total_time = 0.0
         # Các thời gian cho từng phase
         self.t1 = 0.0
@@ -386,5 +386,7 @@ class SplineTrajectory(TrajectoryBase):
         pos = self.start_p + pos * self.direction
         vel = vel * self.direction
         acc = acc * self.direction
-
+        if getattr(self, "debug_trace", False):
+            print(f"[TRAJ][TRACE] Spline desired_state t={t:.6f} pos={pos:.6f} vel={vel:.6f} acc={acc:.6f}")
+        return pos, vel, acc
         return pos, vel, acc
