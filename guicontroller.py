@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import threading
 import time
 import logging
+import math
 from collections import deque
 
 from matplotlib.figure import Figure
@@ -116,22 +117,22 @@ class ControlGUI(tk.Tk):
             "Target Motor 1": (0.0,   "deg"),
             "Target Motor 2": (0.0,   "deg"),
             "Kp0":            (3.0,   None),
-            "Kp1":            (3.0,   None),
+            "Kp1":            (6.0,   None),
             "Kp2":            (3.0,   None),
             "Kd0":            (1.0,   None),
-            "Kd1":            (1.0,   None),
+            "Kd1":            (0.5,   None),
             "Kd2":            (1.0,   None),
             "Control bandwidth": (1200.0, None),
-            "Encoder bandwidth": (50.0,   None),
+            "Encoder bandwidth": (100.0,   None),
         }
         self._ctrl_index = {}
         self.trajectory_var = tk.StringVar(value="Spline")
+        self._last_running_targets: tuple[float, float, float] | None = None
         self._default_load = {
             "External load":   (0.0,   "kg"),
             "Load position":   (0.0,   "m"),
             "Coulomb friction":(0.0,   "Nm"),
             "Viscous friction":(0.0,  "Nm/(rad/s)"), #0.00276
-            "Torque limit":    (0.1,  "Nm"),
         }
         # Cho phép điều chỉnh dải nhập load ngay tại GUI.
         # Mỗi tham số: (min, max, step)
@@ -140,7 +141,6 @@ class ControlGUI(tk.Tk):
             "Load position":    (0.0, 0.0, 0.0),
             "Coulomb friction": (0.0, 0.0, 0.0),
             "Viscous friction": (0.0, 0.0, 0.0),
-            "Torque limit":     (0.2, 0.2, 0.2),
         }
 
         self.plotting  = True
@@ -164,10 +164,12 @@ class ControlGUI(tk.Tk):
         right.pack_propagate(False)
 
         # ── Plot ─────────────────────────────────────────────────────────
-        self.fig = Figure(figsize=(7, 7), dpi=100)
-        self.ax_pos = self.fig.add_subplot(311)
-        self.ax_vel = self.fig.add_subplot(312)
-        self.ax_acc = self.fig.add_subplot(313)
+        self.fig = Figure(figsize=(7, 11), dpi=100)
+        self.ax_pos = self.fig.add_subplot(511)
+        self.ax_vel = self.fig.add_subplot(512)
+        self.ax_acc = self.fig.add_subplot(513)
+        self.ax_tau = self.fig.add_subplot(514)
+        self.ax_tau_ctc = self.fig.add_subplot(515)
         self.fig.tight_layout(pad=2.5)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=left)
@@ -197,13 +199,25 @@ class ControlGUI(tk.Tk):
         self._line_acc1_set, = self.ax_acc.plot([], [], label="Accel M1 Set", color="#FF9800", linestyle="--", alpha=0.6)
         self._line_acc2_set, = self.ax_acc.plot([], [], label="Accel M2 Set", color="#4CAF50", linestyle="--", alpha=0.6)
 
+        self._line_tau0, = self.ax_tau.plot([], [], label="Torque M0 (Nm)", color="#2196F3")
+        self._line_tau1, = self.ax_tau.plot([], [], label="Torque M1 (Nm)", color="#FF9800")
+        self._line_tau2, = self.ax_tau.plot([], [], label="Torque M2 (Nm)", color="#4CAF50")
+
+        self._line_tauctc0, = self.ax_tau_ctc.plot([], [], label="CTC τ J0 (Nm)", color="#2196F3")
+        self._line_tauctc1, = self.ax_tau_ctc.plot([], [], label="CTC τ J1 (Nm)", color="#FF9800")
+        self._line_tauctc2, = self.ax_tau_ctc.plot([], [], label="CTC τ J2 (Nm)", color="#4CAF50")
+
         self.ax_pos.set_ylabel("Position (deg)")
         self.ax_pos.grid(True);  self.ax_pos.legend(loc="upper right", fontsize=7)
         self.ax_vel.set_ylabel("Error (deg)")
         self.ax_vel.grid(True);  self.ax_vel.legend(loc="upper right", fontsize=7)
-        self.ax_acc.set_ylabel("Acceleration")
-        self.ax_acc.set_xlabel("Time (s)")
+        self.ax_acc.set_ylabel("Accel (deg/s²)")
         self.ax_acc.grid(True);  self.ax_acc.legend(loc="upper right", fontsize=7)
+        self.ax_tau.set_ylabel("Torque ĐK (Nm)")
+        self.ax_tau.grid(True);  self.ax_tau.legend(loc="upper right", fontsize=7)
+        self.ax_tau_ctc.set_ylabel("Torque CTC (Nm)")
+        self.ax_tau_ctc.set_xlabel("Time (s)")
+        self.ax_tau_ctc.grid(True);  self.ax_tau_ctc.legend(loc="upper right", fontsize=7)
 
         # ── Action buttons ────────────────────────────────────────────────
         top_right = ttk.Frame(right, padding=6)
@@ -484,26 +498,95 @@ class ControlGUI(tk.Tk):
             else:
                 self.ctrl.return_IDLE()
                 self.btn_mode.config(text="Enable Torque", bg="lightgreen")
+                self._show_idle_snapshot()
         except Exception:
             logger.exception("Mode toggle error")
+
+    def _show_idle_snapshot(self):
+        """Popup 3-panel snapshot (Position, Torque DK, Torque CTC) khi nhấn IDLE."""
+        if not self.ctrl or not getattr(self.ctrl, "connected", False):
+            return
+        data = self.ctrl.get_data()
+        if not data:
+            return
+
+        times     = [d[0]  for d in data]
+        pos0_vals = [d[1]  for d in data]
+        pos1_vals = [d[2]  for d in data]
+        pos2_vals = [d[3]  for d in data]
+        set0_vals = [d[4]  for d in data]
+        set1_vals = [d[5]  for d in data]
+        set2_vals = [d[6]  for d in data]
+
+        # Torque CTC: d[10-12] = _tau_out (torque raw từ CTC)
+        tauctc0_vals = [d[10] for d in data]
+        tauctc1_vals = [d[11] for d in data]
+        tauctc2_vals = [d[12] for d in data]
+
+        # Torque DK: d[13-15] = torque_set (có thể rỗng → dùng 0)
+        if len(data[0]) > 15:
+            tau0_vals = [d[13] for d in data]
+            tau1_vals = [d[14] for d in data]
+            tau2_vals = [d[15] for d in data]
+        else:
+            tau0_vals = tau1_vals = tau2_vals = [0.0] * len(data)
+
+        t0 = times[0]
+        t_rel = [t - t0 for t in times]
+
+        popup = tk.Toplevel(self)
+        popup.title("Run Snapshot — Position / Torque DK / Torque CTC")
+        popup.geometry("900x750")
+
+        fig = Figure(figsize=(9, 9), dpi=100)
+        ax_pos  = fig.add_subplot(311)
+        ax_tau  = fig.add_subplot(312)
+        ax_tauc = fig.add_subplot(313)
+
+        ax_pos.plot(t_rel, pos0_vals, label="Joint 0 (deg)", color="#2196F3")
+        ax_pos.plot(t_rel, pos1_vals, label="Joint 1 (deg)", color="#FF9800")
+        ax_pos.plot(t_rel, pos2_vals, label="Joint 2 (deg)", color="#4CAF50")
+        ax_pos.plot(t_rel, set0_vals, label="J0 Setpoint", color="#2196F3", linestyle="--", alpha=0.6)
+        ax_pos.plot(t_rel, set1_vals, label="J1 Setpoint", color="#FF9800", linestyle="--", alpha=0.6)
+        ax_pos.plot(t_rel, set2_vals, label="J2 Setpoint", color="#4CAF50", linestyle="--", alpha=0.6)
+        ax_pos.set_ylabel("Position (deg)")
+        ax_pos.grid(True)
+        ax_pos.legend(loc="upper right", fontsize=7)
+
+        ax_tau.plot(t_rel, tau0_vals, label="Torque DK J0 (Nm)", color="#2196F3")
+        ax_tau.plot(t_rel, tau1_vals, label="Torque DK J1 (Nm)", color="#FF9800")
+        ax_tau.plot(t_rel, tau2_vals, label="Torque DK J2 (Nm)", color="#4CAF50")
+        ax_tau.set_ylabel("Torque DK (Nm)")
+        ax_tau.grid(True)
+        ax_tau.legend(loc="upper right", fontsize=7)
+
+        ax_tauc.plot(t_rel, tauctc0_vals, label="CTC τ J0 (Nm)", color="#2196F3")
+        ax_tauc.plot(t_rel, tauctc1_vals, label="CTC τ J1 (Nm)", color="#FF9800")
+        ax_tauc.plot(t_rel, tauctc2_vals, label="CTC τ J2 (Nm)", color="#4CAF50")
+        ax_tauc.set_ylabel("Torque CTC (Nm)")
+        ax_tauc.set_xlabel("Time (s)")
+        ax_tauc.grid(True)
+        ax_tauc.legend(loc="upper right", fontsize=7)
+
+        fig.tight_layout(pad=2.5)
+        canvas = FigureCanvasTkAgg(fig, master=popup)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _apply_bandwidth(self):
         """Tính Kp/Kd từ Control Bandwidth (zeta=1)."""
         try:
-            keys = list(self._default_ctrl.keys())
-            idx_bw = keys.index("Control bandwidth")
-            idx_kp = keys.index("Kp")
-            idx_kd = keys.index("Kd")
-
-            bw_str = self.control_panel[idx_bw][1].get().strip()
+            bw_str = self.control_panel[self._ctrl_index["Control bandwidth"]][1].get().strip()
             if not bw_str:
                 return
             omega_n = float(bw_str)
             Kp_cal  = omega_n ** 2
             Kd_cal  = 2.0 * omega_n
 
-            self.control_panel[idx_kp][1].set(f"{Kp_cal:.2f}")
-            self.control_panel[idx_kd][1].set(f"{Kd_cal:.2f}")
+            for i, key in enumerate(["Kp0", "Kp1", "Kp2"]):
+                self.control_panel[self._ctrl_index[key]][1].set(f"{Kp_cal:.2f}")
+            for i, key in enumerate(["Kd0", "Kd1", "Kd2"]):
+                self.control_panel[self._ctrl_index[key]][1].set(f"{Kd_cal:.2f}")
             self.status_text.set(f"Status: Kp={Kp_cal:.2f}, Kd={Kd_cal:.2f}")
         except ValueError:
             messagebox.showerror("Lỗi", "Nhập số hợp lệ vào Control bandwidth!")
@@ -518,12 +601,7 @@ class ControlGUI(tk.Tk):
             return
 
         try:
-            keys = list(self._default_ctrl.keys())
-            idx_kp = keys.index("Kp")
-            idx_kd = keys.index("Kd")
-            idx_bw = keys.index("Control bandwidth")
-
-            bw_str = self.control_panel[idx_bw][1].get().strip()
+            bw_str = self.control_panel[self._ctrl_index["Control bandwidth"]][1].get().strip()
             omega_n = float(bw_str) if bw_str else 10.0
             ps = getattr(self.ctrl, "pos_set", 0.0)
             if isinstance(ps, (list, tuple)):
@@ -539,8 +617,10 @@ class ControlGUI(tk.Tk):
 
             result = optimize_kp_kd(setpoint=setpoint, identified=identified)
 
-            self.control_panel[idx_kp][1].set(f"{result.kp:.2f}")
-            self.control_panel[idx_kd][1].set(f"{result.kd:.2f}")
+            for key in ["Kp0", "Kp1", "Kp2"]:
+                self.control_panel[self._ctrl_index[key]][1].set(f"{result.kp:.2f}")
+            for key in ["Kd0", "Kd1", "Kd2"]:
+                self.control_panel[self._ctrl_index[key]][1].set(f"{result.kd:.2f}")
             try:
                 if isinstance(self.ctrl, twai_controller.TWAIController):
                     self.ctrl.update_ctrlElms(self.ctrl.pos_set[0], self.ctrl.pos_set[1], result.kp, result.kd, omega_n, self.ctrl.enc_bandwidth)
@@ -575,26 +655,29 @@ class ControlGUI(tk.Tk):
         if self.ctrl:
             mode = self.trajectory_var.get()
             print(f"[GUI] Apply Trajectory clicked -> mode={mode}")
-            print(f"[GUI] Controller trajectory_mode set to {self.ctrl.trajectory_mode}")
+            try:
+                t0 = float(self.control_panel[0][1].get().strip() or "0")
+                t1 = float(self.control_panel[1][1].get().strip() or "0")
+                t2 = float(self.control_panel[2][1].get().strip() or "0")
+            except (ValueError, IndexError, tk.TclError):
+                t0 = t1 = t2 = 0.0
             kp0 = float(self.control_panel[self._ctrl_index["Kp0"]][1].get().strip() or "0")
             kp1 = float(self.control_panel[self._ctrl_index["Kp1"]][1].get().strip() or "0")
             kp2 = float(self.control_panel[self._ctrl_index["Kp2"]][1].get().strip() or "0")
             kd0 = float(self.control_panel[self._ctrl_index["Kd0"]][1].get().strip() or "0")
             kd1 = float(self.control_panel[self._ctrl_index["Kd1"]][1].get().strip() or "0")
             kd2 = float(self.control_panel[self._ctrl_index["Kd2"]][1].get().strip() or "0")
-            print(
-                f"[GUI] Current setpoints pos_set=({self.ctrl.pos_set[0]:.6f}, {self.ctrl.pos_set[1]:.6f}, {self.ctrl.pos_set[2]:.6f}) "
-                f"Kp=({kp0:.3f}, {kp1:.3f}, {kp2:.3f}) Kd=({kd0:.3f}, {kd1:.3f}, {kd2:.3f}) bw={self.ctrl.ctrl_bandwidth:.3f} enc_bw={self.ctrl.enc_bandwidth:.3f}"
-            )
+            self._apply_axis_locks()
             self.ctrl.update_ctrlElms(
-                self.ctrl.pos_set[0],
-                self.ctrl.pos_set[1],
-                self.ctrl.pos_set[2],
+                t0, t1, t2,
                 kp0, kp1, kp2,
                 kd0, kd1, kd2,
                 self.ctrl.ctrl_bandwidth,
                 self.ctrl.enc_bandwidth,
             )
+            if callable(getattr(self.ctrl, "apply_gui_targets_deg", None)):
+                self._last_running_targets = None
+                self.ctrl.apply_gui_targets_deg(t0, t1, t2)
             self.status_text.set(f"Status: Applied Trajectory = {mode}")
 
     def _apply_axis_locks(self):
@@ -612,6 +695,7 @@ class ControlGUI(tk.Tk):
 
             self._apply_axis_locks()
             print(f"[GUI] Run CTC Motion targets = ({elms[0]:.6f}, {elms[1]:.6f}, {elms[2]:.6f}), locks = {[bool(v.get()) for v in self.axis_lock_vars]}, traj = {self.trajectory_var.get()}")
+            print(f"[GUI] Kp/Kd axes = Kp({self.control_panel[self._ctrl_index['Kp0']][1].get()}, {self.control_panel[self._ctrl_index['Kp1']][1].get()}, {self.control_panel[self._ctrl_index['Kp2']][1].get()}) Kd({self.control_panel[self._ctrl_index['Kd0']][1].get()}, {self.control_panel[self._ctrl_index['Kd1']][1].get()}, {self.control_panel[self._ctrl_index['Kd2']][1].get()})")
 
             kp0 = float(self.control_panel[self._ctrl_index["Kp0"]][1].get().strip() or "0")
             kp1 = float(self.control_panel[self._ctrl_index["Kp1"]][1].get().strip() or "0")
@@ -632,6 +716,7 @@ class ControlGUI(tk.Tk):
 
             if hasattr(self.ctrl, "motion_armed"):
                 self.ctrl.motion_armed = True
+            self._last_running_targets = None
 
             backend = self.backend_var.get()
             self.status_text.set(f"Status: {backend} M0={p0:.2f}°, M1={p1:.2f}°")
@@ -675,6 +760,22 @@ class ControlGUI(tk.Tk):
         widget.delete(0, tk.END)
         widget.insert(0, value)
         widget.config(state="readonly")
+
+    @staticmethod
+    def _estimate_accel(times: list[float], pos_vals: list[float]) -> list[float]:
+        """Ước lượng gia tốc (deg/s²) từ chuỗi vị trí theo thời gian."""
+        n = len(times)
+        if n < 3:
+            return [0.0] * n
+        acc = [0.0] * n
+        for i in range(1, n - 1):
+            dt1 = times[i] - times[i - 1]
+            dt2 = times[i + 1] - times[i]
+            if dt1 > 1e-6 and dt2 > 1e-6:
+                v1 = (pos_vals[i] - pos_vals[i - 1]) / dt1
+                v2 = (pos_vals[i + 1] - pos_vals[i]) / dt2
+                acc[i] = (v2 - v1) / ((dt1 + dt2) * 0.5)
+        return acc
 
     # ════════════════════════════════════════════════════════════════════════
     # Periodic update (50ms)
@@ -738,10 +839,10 @@ class ControlGUI(tk.Tk):
                 else:
                     self.btn_offset.configure(state="normal",   bg="tomato")
 
-                # TWAI: khi RUNNING, đẩi số trong ô Target Motor → pos_set (không cần bấm Run lại)
+                # TWAI: đổi Target chỉ khi đang RUNNING (motion_armed)
                 if (
-                    motion_armed
-                    and closed_loop
+                    closed_loop
+                    and motion_armed
                     and is_offset
                     and not estop
                     and callable(getattr(ctrl, "apply_gui_targets_deg", None))
@@ -750,8 +851,11 @@ class ControlGUI(tk.Tk):
                         t0 = float(self.control_panel[0][1].get().strip() or "0")
                         t1 = float(self.control_panel[1][1].get().strip() or "0")
                         t2 = float(self.control_panel[2][1].get().strip() or "0")
-                        print(f"[GUI] RUNNING targets -> M0={t0:.3f}, M1={t1:.3f}, M2={t2:.3f}")
-                        ctrl.apply_gui_targets_deg(t0, t1, t2)
+                        targets = (t0, t1, t2)
+                        if self._last_running_targets != targets:
+                            self._last_running_targets = targets
+                            print(f"[GUI] RUNNING targets -> M0={t0:.3f}, M1={t1:.3f}, M2={t2:.3f}")
+                            ctrl.apply_gui_targets_deg(t0, t1, t2)
                     except (ValueError, IndexError, tk.TclError):
                         pass
 
@@ -793,7 +897,6 @@ class ControlGUI(tk.Tk):
                 if self.plotting and ctrl and connected:
                     data = ctrl.get_data()
                     if data:
-                        # data tuple: (time, pos0, pos1, pos2, pos0_set, pos1_set, pos2_set)
                         times     = [d[0] for d in data]
                         pos0_vals = [d[1] for d in data]
                         pos1_vals = [d[2] for d in data]
@@ -804,6 +907,37 @@ class ControlGUI(tk.Tk):
                         err0_vals = [d[4] - d[1] for d in data]
                         err1_vals = [d[5] - d[2] for d in data]
                         err2_vals = [d[6] - d[3] for d in data]
+
+                        if len(data[0]) >= 10:
+                            acc0_set = [d[7] for d in data]
+                            acc1_set = [d[8] for d in data]
+                            acc2_set = [d[9] for d in data]
+                            acc0_vals = self._estimate_accel(times, pos0_vals)
+                            acc1_vals = self._estimate_accel(times, pos1_vals)
+                            acc2_vals = self._estimate_accel(times, pos2_vals)
+                        else:
+                            acc0_vals = acc1_vals = acc2_vals = []
+                            acc0_set = acc1_set = acc2_set = []
+
+                        if len(data[0]) >= 13:
+                            tau0_vals = [d[10] for d in data]
+                            tau1_vals = [d[11] for d in data]
+                            tau2_vals = [d[12] for d in data]
+                        elif hasattr(ctrl, "torque_set"):
+                            with ctrl.data_lock:
+                                t0, t1, t2 = ctrl.torque_set[0], ctrl.torque_set[1], ctrl.torque_set[2]
+                            tau0_vals = [t0] * len(times)
+                            tau1_vals = [t1] * len(times)
+                            tau2_vals = [t2] * len(times)
+                        else:
+                            tau0_vals = tau1_vals = tau2_vals = []
+
+                        if len(data[0]) >= 25:
+                            tauctc0_vals = [d[22] for d in data]
+                            tauctc1_vals = [d[23] for d in data]
+                            tauctc2_vals = [d[24] for d in data]
+                        else:
+                            tauctc0_vals = tauctc1_vals = tauctc2_vals = []
 
                         t0 = times[0] if self._last_t0 is None else self._last_t0
                         if self._last_t0 is None or (times[-1] - t0) > 30.0:
@@ -821,8 +955,32 @@ class ControlGUI(tk.Tk):
                         self._line_err1.set_data(t_rel, err1_vals)
                         self._line_err2.set_data(t_rel, err2_vals)
 
+                        if acc0_vals:
+                            self._line_acc0.set_data(t_rel, acc0_vals)
+                            self._line_acc1.set_data(t_rel, acc1_vals)
+                            self._line_acc2.set_data(t_rel, acc2_vals)
+                            self._line_acc0_set.set_data(t_rel, acc0_set)
+                            self._line_acc1_set.set_data(t_rel, acc1_set)
+                            self._line_acc2_set.set_data(t_rel, acc2_set)
+
+                        if tau0_vals:
+                            self._line_tau0.set_data(t_rel, tau0_vals)
+                            self._line_tau1.set_data(t_rel, tau1_vals)
+                            self._line_tau2.set_data(t_rel, tau2_vals)
+
+                        if tauctc0_vals:
+                            self._line_tauctc0.set_data(t_rel, tauctc0_vals)
+                            self._line_tauctc1.set_data(t_rel, tauctc1_vals)
+                            self._line_tauctc2.set_data(t_rel, tauctc2_vals)
+
                         self.ax_pos.relim(); self.ax_pos.autoscale_view()
                         self.ax_vel.relim(); self.ax_vel.autoscale_view()
+                        if acc0_vals:
+                            self.ax_acc.relim(); self.ax_acc.autoscale_view()
+                        if tau0_vals:
+                            self.ax_tau.relim(); self.ax_tau.autoscale_view()
+                        if tauctc0_vals:
+                            self.ax_tau_ctc.relim(); self.ax_tau_ctc.autoscale_view()
                         self.canvas.draw_idle()
 
         except Exception:
