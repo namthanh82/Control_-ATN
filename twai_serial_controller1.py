@@ -6,10 +6,21 @@ import serial.tools.list_ports
 from collections import deque
 
 import numpy as np
-
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from kinematic import get_acc_jerk
 from trajectory import SplineTrajectory, QuinticTrajectory
-from ctc_3dof import CTC3Gains, CTC3Model, JointParams, ctc_3dof
+from ctc_3dof import CTC3Gains, CTC3Model, JointParams, ctc_3dof, ctc_3dof_components
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _lp_alpha_from_fc(fc_hz: float, fs_hz: float) -> float:
+    """Compute IIR 1-pole LP alpha from corner frequency.
+    y[n] = alpha * x[n] + (1-alpha) * y[n-1]
+    alpha = 2π·fc / (2π·fc + fs)
+    fs = loop frequency (Hz), fc = desired -3dB corner (Hz).
+    """
+    return (2.0 * math.pi * fc_hz) / (2.0 * math.pi * fc_hz + fs_hz)
 
 # ── Constants (khớp với các controller khác trong project) ──────────────────
 AXIS_STATE_IDLE               = 1
@@ -45,7 +56,7 @@ class TWAIController(threading.Thread):
     def __init__(
         self,
         serial_port: str = "COM21",
-        baudrate: int = 115200,
+        baudrate: int = 230400,
     ):
         super().__init__(daemon=True)
 
@@ -62,16 +73,30 @@ class TWAIController(threading.Thread):
         self.esp32_ready        = False   # True sau khi nhận "READY:"
         self.pending_closed_loop = False  # User pressed Enable Torque before ESP32 READY
         self.status_message     = "Chưa kết nối"
+        self._last_fb_time     = 0.0
 
         # ── Threading primitives ─────────────────────────────────────────
         self.data_lock   = threading.Lock()
         self._stop_event  = threading.Event()
         self._estop_event = threading.Event()
-
-        # ── Physics / Kinematic (giống các controller cũ) ────────────────
-        self.start_pos       = 0.0        # degrees – vị trí gốc khi offset
-        # ── Offset (revolutions, raw ODrive value tại thời điểm set_offset) ─
-        self.offset_rev = [0.0, 0.0, 0.0]      # offset cho motor 0, 1 và 2
+        # ── Offset / encoder state ───────────────────────────────────────
+        self.offset_rev = [0.0, 0.0, 0.0]      
+        self.motor_pos_rev = [0.0, 0.0, 0.0]   
+        self.joint_pos_deg = [0.0, 0.0, 0.0]    
+        self.joint_offset_deg = [0.0, 0.0, 0.0]  
+        self.model_home_deg = [0.0, -90.0, 0.0]
+        self.use_joint_feedback = True         # khi True, CTC dùng joint encoder làm feedback chính
+        self.debug_sign_trace = True         # bật in [TWAI][TRACE] CTC/trajectory
+        self.debug_serial_verbose = False    # True = in mọi dòng nhận từ ESP32 (tắt khi chạy ổn định)
+        self.debug_timing = True            # True = in thống kê timing vòng feedback mỗi 1s
+        self._trace_log_interval_s = 0.25      # giới hạn trace vòng lặp ~100Hz → tối đa ~4 dòng/giây
+        self._last_trace_loop_pc = 0.0
+        # Timing stats (reset mỗi lần bắt đầu run)
+        self._timing_last_esp_ms = 0
+        self._timing_last_pc_s = 0.0
+        self._timing_dts = []              # list[float] loop_dt (ms)
+        self._timing_latency = []          # list[float] esp→PC latency (ms)
+        self._timing_last_report = 0.0
 
         # ── Position state (degrees) ─────────────────────────────────────
         self.pos  = [0.0, 0.0, 0.0]           # vị trí hiện tại (degrees)
@@ -88,17 +113,16 @@ class TWAIController(threading.Thread):
         self._home_pending = False
         self.target_tolerance_deg = 1.0
         self.target_tolerance_vel = 2.0
-        self._last_motion_targets = [0.0, 0.0, 0.0]
-
+        self._last_motion_targets = [0.0, 0.0, 0.0] 
         # ── CTC plant + spline (cùng cấu trúc trajectory_controller.ODriveThread) ──
         self.trajectory_mode = "spline"
         self.traj      = [SplineTrajectory(), SplineTrajectory(), SplineTrajectory()]
         self.acc_set   = [0.0, 0.0, 0.0]
-        self.max_vel   = 5.0  # °/s — giới hạn cho param_calc của spline (GUI có thể mở rộng sau)
+        self.max_vel   = 25 # °/s — giới hạn cho param_calc của spline (GUI có thể mở rộng sau)
         self._motion_t0           = -math.inf
         self._motion_time_active  = False
         self._was_motion_armed    = False
-        self.tor_coef  = 0.708282
+        self.tor_coef  = 1.0
         self.gear_ratio = gear_ratio_small
         # Per-link physical parameters for the 3-DOF chain
         self.hip_link_mass = 2.4582
@@ -127,30 +151,41 @@ class TWAIController(threading.Thread):
         self.ext_load = 0.0
         self.hanger_mass = 0.0
         self.hanger_distance = 0.0
-        self.coul_friction = 0.05  
-        self.visc_friction = 0.00276 
+        self.coul_friction = 0.05
+        self.visc_friction = 0.00276
         self._recalc_plant_mass_inertia()
 
         # ── Vận tốc từ FB: dùng perf_counter + LP để tránh dt≈0 khi nhiều FB trong một lần đọc Serial
         self._fb_prev_pc: float | None = None
         self._fb_prev_p = [0.0, 0.0, 0.0]
         self._fb_have_prev = False
-        self._vel_lp_alpha = 0.35
         self._vel_max_deg_s = 800.0
+        # ── LP filter cho qdot (tốc độ phản hồi thực) ───────────────────────
+        # fc: corner frequency (Hz). Lọc nhiễu encoder trước khi tính Kd·de.
+        #   50-70 Hz: lọc mạnh, mượt, dùng với Kd cao
+        #   80-120 Hz: lọc nhẹ, phản ứng nhanh, dùng với Kd thấp
+        #   công thức: alpha = 2π·fc / (2π·fc + fs), fs = 100 Hz (loop chính)
+        self._vel_lp_hz = 80.0
+        self._vel_lp_alpha = _lp_alpha_from_fc(self._vel_lp_hz, 100.0)
+        self._vel_lp_prev = [0.0, 0.0, 0.0]   # prev LP state
+        # ── LP filter cho qdot_d (feedforward velocity từ trajectory) ─────────
+        # Giữ riêng để có thể lọc trajectory mà không ảnh hưởng vel phản hồi.
+        self._vel_set_lp_hz = 80.0
+        self._vel_set_lp_alpha = _lp_alpha_from_fc(self._vel_set_lp_hz, 100.0)
+        self._vel_set_lp_prev = [0.0, 0.0, 0.0]
 
-        # ── Raw position từ ESP32 (revolutions) ──────────────────────────
-        self._raw_pos = [0.0, 0.0, 0.0]  
         self.torque_set = [0.0, 0.0, 0.0]
+        self._last_tau_raw = (0.0, 0.0, 0.0)
         self.use_torque_commands = True
 
         # ── Control params (dùng cho GUI control panel) ──────────────────
-        self.Kp_axes = [3.0, 3.0, 3.0]
-        self.Kd_axes = [1.0, 1.0, 1.0]
+        self.Kp_axes = [3.0, 6.0, 3.0]
+        self.Kd_axes = [1.0, 0.5, 1.0]
         self.Kp3 = tuple(self.Kp_axes)
         self.Kd3 = tuple(self.Kd_axes)
-        self.ctrl_bandwidth = 2000
-        self.enc_bandwidth  = 50
-        self.max_torque     = 0.3  # torque limit used for saturation in bridge mode
+        self.ctrl_bandwidth = 1200
+        self.enc_bandwidth  = 100
+        self.max_torque     = 1.5 # torque limit used for saturation in bridge mode
         self.use_torque_mode = True
         self.friction_only_mode = False
         self.friction_only_axis: int | None = None
@@ -162,7 +197,6 @@ class TWAIController(threading.Thread):
         self.timeFilBuf  = [deque(maxlen=self.window_size), deque(maxlen=self.window_size), deque(maxlen=self.window_size)]
 
         # ── Data buffer (GUI reads for plotting) ─────────────────────────
-        # Tuple: (timestamp, pos0_deg, pos1_deg, pos2_deg, pos0_set_deg, pos1_set_deg, pos2_set_deg)
         self.data: deque = deque(maxlen=800)
 
         # ── Serial receive line buffer ───────────────────────────────────
@@ -172,8 +206,7 @@ class TWAIController(threading.Thread):
 
         # Giới hạn tốc độ đổi mô-men (Nm mỗi bước ~10ms) để tránh flip ±max_torque quá nhanh → lắc
         self._tau_out = [0.0, 0.0, 0.0]
-        self._tau_slew_frac_cap = 0.22  # tối đa ~22% max_torque mỗi bước vòng lặp
-        self.motor_efficiency = (0.90, 0.90, 0.90)
+        self.motor_efficiency = (1, 1, 1)
         self.model3 = CTC3Model(
             joints=(
                 JointParams(mass=self.hip_link_mass, length=self.hip_link_length, com_distance=self.hip_link_com_distance, inertia=self.hip_link_inertia, motor_inertia=self.big_motor_inertia, gear_ratio=gear_ratio_big),
@@ -266,6 +299,8 @@ class TWAIController(threading.Thread):
         self.status_message = "IDLE"
         print("[TWAI] Trở về IDLE.")
 
+
+
     def is_controlable(self):
         return (
             self.connected
@@ -282,6 +317,8 @@ class TWAIController(threading.Thread):
         self.motion_armed = False
         self._was_motion_armed = False
         self._motion_time_active = False
+        self._vel_lp_prev = [0.0, 0.0, 0.0]
+        self._vel_set_lp_prev = [0.0, 0.0, 0.0]
         self._send_simple_cmd("IDLE")
         self.status_message = "ESTOP!"
         print("[TWAI] EMERGENCY STOP!")
@@ -304,12 +341,20 @@ class TWAIController(threading.Thread):
             self._fb_prev_pc = None
             self.vel[0] = 0.0
             self.vel[1] = 0.0
+            self.vel[2] = 0.0
             self.acc_set[0] = 0.0
             self.acc_set[1] = 0.0
+            self.acc_set[2] = 0.0
             self._last_motion_targets[0] = 0.0
             self._last_motion_targets[1] = 0.0
+            self._last_motion_targets[2] = 0.0
+            self.joint_offset_deg = [0.0, 0.0, 0.0]
             self._clear_vel_fit_buffers_locked()
             self._reset_torque_slew()
+            self._timing_dts = []
+            self._timing_latency = []
+            self._timing_last_report = 0.0
+            self._timing_last_pc_s = 0.0
         self.return_IDLE()
         self._send_simple_cmd("CLEAR")
         self.status_message = "Reset xong"
@@ -325,35 +370,58 @@ class TWAIController(threading.Thread):
 
     def set_offset(self):
         """
-        Lưu raw revolutions hiện tại làm offset tham chiếu, giống
-        trajectory_controller.py dùng axis.encoder.pos_estimate.
+        Lưu vị trí hiện tại làm home (0°):
+        - motor encoder: offset_rev từ FB
+        - joint encoder: joint_offset_deg từ FBJ (khi use_joint_feedback)
         """
         with self.data_lock:
-            self.offset_rev[0] = self._raw_pos[0]
-            self.offset_rev[1] = self._raw_pos[1]
-            self.offset_rev[2] = self._raw_pos[2]
+            self.offset_rev[0] = self.motor_pos_rev[0]
+            self.offset_rev[1] = self.motor_pos_rev[1]
+            self.offset_rev[2] = self.motor_pos_rev[2]
+            for i in range(3):
+                # joint_pos_deg đã là góc tương đối home; cộng offset cũ = góc thô từ firmware
+                self.joint_offset_deg[i] = self.joint_pos_deg[i] + self.joint_offset_deg[i]
+                self.joint_pos_deg[i] = 0.0
+                self.pos[i] = 0.0
+                self.pos_set[i] = 0.0
+                self.vel_set[i] = 0.0
+                self.acc_set[i] = 0.0
+                self._last_pos_set[i] = 0.0
+                self._last_motion_targets[i] = 0.0
             self.isOffset = True
+            self.motion_armed = False
+            self._motion_hold = False
+            self._motion_time_active = False
+            self._motion_t0 = -math.inf
+            self._was_motion_armed = False
             self._fb_have_prev = False
             self._fb_prev_pc = None
-            self.vel[0] = self.vel[1] = 0.0
-            self._tau_out[0] = self._tau_out[1] = 0.0
+            self._fb_prev_p = [0.0, 0.0, 0.0]
+            self.vel[0] = self.vel[1] = self.vel[2] = 0.0
+            self._tau_out[0] = self._tau_out[1] = self._tau_out[2] = 0.0
             self._clear_vel_fit_buffers_locked()
-        print(f"[TWAI] Offset set: motor0={self.offset_rev[0]:.4f} rev, "
-              f"motor1={self.offset_rev[1]:.4f} rev")
+            self._timing_dts = []
+            self._timing_latency = []
+            self._timing_last_report = 0.0
+            self._timing_last_pc_s = 0.0
+            for traj in self.traj:
+                traj.reset()
+        self.status_message = "Offset set — vị trí hiện tại = home (0°)"
+        print(f"[TWAI] Offset/home set: motor_rev=({self.offset_rev[0]:.4f}, {self.offset_rev[1]:.4f}, {self.offset_rev[2]:.4f}), "
+              f"joint_offset_deg=({self.joint_offset_deg[0]:.3f}, {self.joint_offset_deg[1]:.3f}, {self.joint_offset_deg[2]:.3f})")
 
     # ════════════════════════════════════════════════════════════════════════
     # Unit conversion helpers
     # ════════════════════════════════════════════════════════════════════════
 
     def _rev_to_deg(self, rev: float, motor_id: int) -> float:
-        """ODrive raw rev → degrees (với offset và start_pos)."""
         gear = self.gear_ratios[motor_id] if hasattr(self, "gear_ratios") else self.gear_ratio
-        return (rev - self.offset_rev[motor_id]) * 360.0 / gear + self.start_pos
+        return (rev - self.offset_rev[motor_id]) * 360.0 * gear + self.start_pos
 
     def _deg_to_rev(self, deg: float, motor_id: int) -> float:
-        """Degrees → ODrive raw rev (ngược lại với _rev_to_deg)."""
+        """Degrees → ODrive raw rev (motor-side only)."""
         gear = self.gear_ratios[motor_id] if hasattr(self, "gear_ratios") else self.gear_ratio
-        return (deg - self.start_pos) * gear / 360.0 + self.offset_rev[motor_id]
+        return (deg - self.start_pos) / 360.0 / gear + self.offset_rev[motor_id]
 
     def _clear_vel_fit_buffers_locked(self):
         for buf in self.velFilBuf:
@@ -371,6 +439,10 @@ class TWAIController(threading.Thread):
         gán vào self.vel khi cửa sổ đã đầy.
 
         kinematic.get_acc_jerk yêu cầu window_size lẻ.
+
+        Sau poly-fit (smooth), đầu ra được LP-filter thêm một lớp nữa qua IIR 1-pole
+        với corner frequency `_vel_lp_hz` Hz (mặc định 80 Hz) để triệt nhiễu encoder
+        high-frequency trước khi tính Kd·de.
         """
         for i, v_inst in enumerate((v0_inst, v1_inst, v2_inst)):
             self.velFilBuf[i].append(v_inst)
@@ -384,13 +456,16 @@ class TWAIController(threading.Thread):
                         self.poly_order,
                     )
                     lim = self._vel_max_deg_s
-                    self.vel[i] = max(min(float(vf), lim), -lim)
+                    vf_clipped = max(min(float(vf), lim), -lim)
                 except ValueError:
-                    a = self._vel_lp_alpha
-                    self.vel[i] = a * v_inst + (1.0 - a) * self.vel[i]
+                    vf_clipped = v_inst
+                a = self._vel_lp_alpha
+                self.vel[i] = a * vf_clipped + (1.0 - a) * self._vel_lp_prev[i]
+                self._vel_lp_prev[i] = self.vel[i]
             else:
                 a = self._vel_lp_alpha
-                self.vel[i] = a * v_inst + (1.0 - a) * self.vel[i]
+                self.vel[i] = a * v_inst + (1.0 - a) * self._vel_lp_prev[i]
+                self._vel_lp_prev[i] = self.vel[i]
 
     def _recalc_plant_mass_inertia(self):
         """Maintain legacy lumped parameters for compatibility with GUI/test code."""
@@ -420,13 +495,32 @@ class TWAIController(threading.Thread):
     def _set_target_state(self, motor_id: int, target_deg: float):
         """Tính quỹ đạo từ vị trí hiện tại tới target (chỉ gọi trong data_lock)."""
         self.traj[motor_id] = self._make_trajectory()
-        self.traj[motor_id].param_calc(self.pos[motor_id], target_deg, self.max_vel)
+        start_p = self.pos[motor_id]
+        self.traj[motor_id].param_calc(start_p, target_deg, self.max_vel)
+        if self.debug_sign_trace:
+            print(
+                f"[TWAI][TRACE] _set_target_state joint={motor_id} traj={type(self.traj[motor_id]).__name__} "
+                f"start_p={start_p:.6f} target_deg={target_deg:.6f} max_vel={self.max_vel:.6f}"
+            )
+
+    def _trace_loop_due(self) -> bool:
+        """Chỉ cho phép in trace vòng điều khiển vài lần/giây (tránh spam ~100Hz)."""
+        if not self.debug_sign_trace:
+            return False
+        now = time.perf_counter()
+        if now - self._last_trace_loop_pc < self._trace_log_interval_s:
+            return False
+        self._last_trace_loop_pc = now
+        return True
 
     def _motion_clock_start(self):
         self._motion_t0 = time.time()
         self._motion_time_active = True
+        # Reset LP filter state để tránh spike từ giá trị cũ khi bắt đầu motion mới.
+        self._vel_lp_prev = [0.0, 0.0, 0.0]
+        self._vel_set_lp_prev = [0.0, 0.0, 0.0]
 
-    def _refresh_traj_refs_locked(self, now: float):
+    def _refresh_traj_refs_locked(self, now: float, trace: bool = False):
         """Cập nhật pos_set / vel_set / acc_set theo thời gian đã trôi của spline."""
         if self._motion_time_active:
             t_prog = max(now - self._motion_t0, 0.0)
@@ -435,36 +529,59 @@ class TWAIController(threading.Thread):
         for i in (0, 1, 2):
             p_des, v_des, a_des = self.traj[i].desired_state(t_prog)
             self.pos_set[i], self.vel_set[i], self.acc_set[i] = p_des, v_des, a_des
-            if getattr(self, "debug_sign_trace", False):
-                tr = self.traj[i]
-                print(f"[TWAI][TRACE] desired_state joint={i} traj={type(tr).__name__} t={t_prog:.6f} start={tr.start_p:.6f} end={tr.end_p:.6f} pos={p_des:.6f} vel={v_des:.6f} acc={a_des:.6f}")
+        if trace:
+            print(
+                f"[TWAI][TRACE] traj t={t_prog:.3f}s "
+                f"pos_set=({self.pos_set[0]:.3f}, {self.pos_set[1]:.3f}, {self.pos_set[2]:.3f}) "
+                f"vel_set=({self.vel_set[0]:.3f}, {self.vel_set[1]:.3f}, {self.vel_set[2]:.3f})"
+            )
 
-    def _dynamic_calculation_locked(self, active_axis: int | None = None):
+    def _dynamic_calculation_locked(self, active_axis: int | None = None, trace: bool = False):
         """Compute 3-DOF torque commands using the M+C+G CTC model."""
         gains = CTC3Gains(kp=self.Kp3, kd=self.Kd3)
         self.model3.torque_scale = self.tor_coef
-        q = [self.pos[i] * DEG2RAD for i in range(3)]
-        qd = [self.pos_set[i] * DEG2RAD for i in range(3)]
+        # Đồng bộ hệ số bù mô hình mỗi tick (cho phép tune runtime).
+        q_source = self.joint_pos_deg if self.use_joint_feedback else self.pos
+        # Cộng offset home vật lý để CTC thấy góc thật (bù trọng lực đúng pha).
+        # Sai số e=qd-q không đổi vì cùng cộng offset cho cả q và qd.
+        q = [(q_source[i] + self.model_home_deg[i]) * DEG2RAD for i in range(3)]
+        qd = [(self.pos_set[i] + self.model_home_deg[i]) * DEG2RAD for i in range(3)]
         qdot = [self.vel[i] * DEG2RAD for i in range(3)]
-        qdot_d = [self.vel_set[i] * DEG2RAD for i in range(3)]
+        # LP filter cho qdot_d (feedforward vel từ trajectory).
+        # vel_set có thể có chatter từ spline derivative — lọc để Kd term không bị nhiễu.
+        qdot_d = []
+        for i in range(3):
+            vs_raw = self.vel_set[i] * DEG2RAD
+            a = self._vel_set_lp_alpha
+            vs_filt = a * vs_raw + (1.0 - a) * self._vel_set_lp_prev[i]
+            self._vel_set_lp_prev[i] = vs_filt
+            qdot_d.append(vs_filt)
         qddot_d = [self.acc_set[i] * DEG2RAD for i in range(3)]
-        if getattr(self, "debug_sign_trace", False):
-            print(f"[TWAI][TRACE] dynamic q=({q[0]:.6f}, {q[1]:.6f}, {q[2]:.6f}) qd=({qd[0]:.6f}, {qd[1]:.6f}, {qd[2]:.6f}) qdot=({qdot[0]:.6f}, {qdot[1]:.6f}, {qdot[2]:.6f}) qdot_d=({qdot_d[0]:.6f}, {qdot_d[1]:.6f}, {qdot_d[2]:.6f}) qddot_d=({qddot_d[0]:.6f}, {qddot_d[1]:.6f}, {qddot_d[2]:.6f})")
-        tau = ctc_3dof(qd, q, qdot_d, qdot, qddot_d, gains, self.model3)
+
+        # Smooth-startup: t_prog tính từ lúc bắt đầu motion để blend G_hold→G_ff.
+        if self._motion_time_active:
+            startup_t = max(time.time() - self._motion_t0, 0.0)
+        else:
+            startup_t = 0.0
+
+        comp = ctc_3dof_components(qd, q, qdot_d, qdot, qddot_d, gains, self.model3, startup_t=startup_t)
+        tau = comp["tau"]
         self._last_tau_raw = tuple(tau)
-        if getattr(self, "debug_sign_trace", False):
-            print(f"[TWAI][TRACE] dynamic tau_raw=({tau[0]:.6f}, {tau[1]:.6f}, {tau[2]:.6f}) active_axis={active_axis}")
-            print(
-                f"[TWAI][TRACE] joint_to_motor_torque mapped=({self._joint_to_motor_torque(0, tau[0]):.6f}, {self._joint_to_motor_torque(1, tau[1]):.6f}, {self._joint_to_motor_torque(2, tau[2]):.6f}) "
-                f"gear=({self.gear_ratios[0]:.1f}, {self.gear_ratios[1]:.1f}, {self.gear_ratios[2]:.1f}) eff=({self.motor_efficiency[0]:.2f}, {self.motor_efficiency[1]:.2f}, {self.motor_efficiency[2]:.2f})"
-            )
         for i in range(3):
             if active_axis is None or i == active_axis:
                 self.torque_set[i] = float(tau[i])
             else:
                 self.torque_set[i] = 0.0
-        if getattr(self, "debug_sign_trace", False):
-            print(f"[TWAI][TRACE] dynamic joint_torque_set=({self.torque_set[0]:.6f}, {self.torque_set[1]:.6f}, {self.torque_set[2]:.6f})")
+        if trace:
+            G = comp["g"]
+            w = comp["startup_w"]
+            print(
+                f"[TWAI][TRACE] ctc t_prog={startup_t:.3f}s w={w:.2f} "
+                f"q_deg=({q_source[0]:.3f},{q_source[1]:.3f},{q_source[2]:.3f}) "
+                f"qd_deg=({self.pos_set[0]:.3f},{self.pos_set[1]:.3f},{self.pos_set[2]:.3f}) "
+                f"G=({G[0]:.3f},{G[1]:.3f},{G[2]:.3f}) "
+                f"tau=({self.torque_set[0]:.3f},{self.torque_set[1]:.3f},{self.torque_set[2]:.3f})"
+            )
 
     def _reset_torque_slew(self):
         self._tau_out[0] = 0.0
@@ -484,10 +601,10 @@ class TWAIController(threading.Thread):
         return float(tau_motor) * float(gear) * float(eff)
 
     def _slew_limited_torque(self, axis: int, tau_des: float) -> float:
-        prev = self._tau_out[axis]
-        max_step = max(self.max_torque * self._tau_slew_frac_cap, 1e-6)
-        d = max(min(tau_des - prev, max_step), -max_step)
-        out = max(min(prev + d, self.max_torque), -self.max_torque)
+        # Option B: ramp ở ODrive (INPUT_MODE_TORQUE_RAMP), host chỉ clip theo max_torque.
+        out = max(min(float(tau_des), self.max_torque), -self.max_torque)
+
+
         self._tau_out[axis] = out
         return out
 
@@ -533,86 +650,200 @@ class TWAIController(threading.Thread):
                     line = line.strip()
                     if not line:
                         continue
+                    if self.debug_serial_verbose:
+                        print(f"[TWAI] RX raw: '{line}'")
                     self._parse_line(line)
         except Exception as e:
             print(f"[TWAI] Lỗi đọc Serial: {e}")
             self.connected = False
 
     def _parse_line(self, line: str):
-        """Xử lý một dòng text từ ESP32."""
+        """Xử lý một dòng text từ ESP32.
+
+        Firmware gửi:
+          FB,ts_ms,mot0_rev,mot1_rev,mot2_rev,joint0_deg,joint1_deg,joint2_deg
+        """
+        if self.debug_serial_verbose:
+            print(f"[TWAI] <<< {line}")
         if line.startswith("FB,"):
             parts = line[3:].split(",")
-            if len(parts) >= 3:
-                try:
-                    raw0 = float(parts[0])
-                    raw1 = float(parts[1])
-                    raw2 = float(parts[2])
-                    if not self.esp32_ready:
-                        self.esp32_ready = True
-                        self.status_message = "ESP32 READY qua feedback"
-                        if self.pending_closed_loop and not self.closed_loop_control:
-                            print("[TWAI] Feedback READY, tự vào Closed Loop theo yêu cầu trước đó.")
-                            self.enter_closed_loop()
-                    with self.data_lock:
-                        self._raw_pos[0] = raw0
-                        self._raw_pos[1] = raw1
-                        self._raw_pos[2] = raw2
-                        new_pos0 = self._rev_to_deg(raw0, 0)
-                        new_pos1 = self._rev_to_deg(raw1, 1)
-                        new_pos2 = self._rev_to_deg(raw2, 2)
-                        now = time.time()
-                        now_pc = time.perf_counter()
-                        if self._fb_have_prev and self._fb_prev_pc is not None:
-                            dt_fb = now_pc - self._fb_prev_pc
-                            dt_fb = max(min(dt_fb, 0.25), 1e-4)
-                            v0_raw = (new_pos0 - self._fb_prev_p[0]) / dt_fb
-                            v1_raw = (new_pos1 - self._fb_prev_p[1]) / dt_fb
-                            v2_raw = (new_pos2 - self._fb_prev_p[2]) / dt_fb
-                            lim = self._vel_max_deg_s
-                            v0_raw = max(min(v0_raw, lim), -lim)
-                            v1_raw = max(min(v1_raw, lim), -lim)
-                            v2_raw = max(min(v2_raw, lim), -lim)
-                            self._update_vel_estimates_locked(now, v0_raw, v1_raw, v2_raw)
-                        self._fb_prev_pc = now_pc
-                        self._fb_prev_p[0] = new_pos0
-                        self._fb_prev_p[1] = new_pos1
-                        self._fb_prev_p[2] = new_pos2
-                        self._fb_have_prev = True
-                        self.pos[0] = new_pos0
-                        self.pos[1] = new_pos1
-                        self.pos[2] = new_pos2
-                        self.data.append((
-                            now,
-                            self.pos[0], self.pos[1], self.pos[2],
-                            self.pos_set[0], self.pos_set[1], self.pos_set[2]
-                        ))
-                except ValueError:
-                    pass
+            if len(parts) < 7:
+                print(f"[TWAI] FB format error: {len(parts)} values — '{line}'")
+                return
+            try:
+                ts_ms = int(parts[0])       # ESP32 millis() timestamp
+                raw0  = float(parts[1])
+                raw1  = float(parts[2])
+                raw2  = float(parts[3])
+                j0    = float(parts[4])
+                j1    = float(parts[5])
+                j2    = float(parts[6])
+                if self.debug_serial_verbose:
+                    print(f"[TWAI] RAW motor1={raw1:.6f}  joint1={j1:.4f}")
+            except ValueError:
+                if self.debug_serial_verbose:
+                    print(f"[TWAI] FB ValueError: parts={parts!r}")
+                return
+
+            self._last_fb_time = time.time()
+            if not self.esp32_ready:
+                self.esp32_ready = True
+                self.status_message = "ESP32 READY"
+                if self.pending_closed_loop and not self.closed_loop_control:
+                    print("[TWAI] Feedback READY, tự vào Closed Loop.")
+                    self.enter_closed_loop()
+            self.error = False
+
+            with self.data_lock:
+                now = time.time()
+                now_pc = time.perf_counter()
+
+                # Motor encoder positions (for reference / calibration)
+                self.motor_pos_rev[0] = raw0
+                self.motor_pos_rev[1] = raw1
+                self.motor_pos_rev[2] = raw2
+
+                # Joint angles — subtract offset so home = 0°
+                j0_off = j0 - self.joint_offset_deg[0]
+                j1_off = j1 - self.joint_offset_deg[1]
+                j2_off = j2 - self.joint_offset_deg[2]
+
+                # Motor encoder in degrees (always calculated from raw rev)
+                mot0_deg = self._rev_to_deg(raw0, 0)
+                mot1_deg = self._rev_to_deg(raw1, 1)
+                mot2_deg = self._rev_to_deg(raw2, 2)
+
+                # Decide which source feeds pos and vel
+                if self.use_joint_feedback:
+                    self.pos[0] = j0_off
+                    self.pos[1] = j1_off
+                    self.pos[2] = j2_off
+                    self.joint_pos_deg[0] = j0_off
+                    self.joint_pos_deg[1] = j1_off
+                    self.joint_pos_deg[2] = j2_off
+                else:
+                    new_p0 = self._rev_to_deg(raw0, 0)
+                    new_p1 = self._rev_to_deg(raw1, 1)
+                    new_p2 = self._rev_to_deg(raw2, 2)
+                    self.pos[0] = new_p0
+                    self.pos[1] = new_p1
+                    self.pos[2] = new_p2
+
+                # Velocity from whichever source is active
+                p0, p1, p2 = self.pos[0], self.pos[1], self.pos[2]
+                if self._fb_have_prev and self._fb_prev_pc is not None:
+                    dt = now_pc - self._fb_prev_pc
+                    dt = max(min(dt, 0.25), 1e-4)
+                    v0 = (p0 - self._fb_prev_p[0]) / dt
+                    v1 = (p1 - self._fb_prev_p[1]) / dt
+                    v2 = (p2 - self._fb_prev_p[2]) / dt
+                    lim = self._vel_max_deg_s
+                    self._update_vel_estimates_locked(
+                        now,
+                        max(min(v0, lim), -lim),
+                        max(min(v1, lim), -lim),
+                        max(min(v2, lim), -lim),
+                    )
+                self._fb_prev_pc = now_pc
+                self._fb_prev_p[0] = p0
+                self._fb_prev_p[1] = p1
+                self._fb_prev_p[2] = p2
+                self._fb_have_prev = True
+
+                self.data.append((
+                    now,
+                    self.pos[0], self.pos[1], self.pos[2],      # 1-3: active feedback (joint or motor deg)
+                    self.pos_set[0], self.pos_set[1], self.pos_set[2],  # 4-6: setpoint
+                    self.acc_set[0], self.acc_set[1], self.acc_set[2],  # 7-9: acc set
+                    self._tau_out[0], self._tau_out[1], self._tau_out[2],  # 10-12: torque out
+                    self.torque_set[0], self.torque_set[1], self.torque_set[2],  # 13-15: torque set
+                    mot0_deg, mot1_deg, mot2_deg,                # 16-18: motor encoder deg
+                    j0 - self.joint_offset_deg[0],              # 19: raw joint0 - offset
+                    j1 - self.joint_offset_deg[1],              # 20: raw joint1 - offset
+                    j2 - self.joint_offset_deg[2],              # 21: raw joint2 - offset
+                ))
+                if self.debug_serial_verbose:
+                    print(f"[TWAI] APPEND pos=({self.pos[0]:.3f},{self.pos[1]:.3f},{self.pos[2]:.3f}) "
+                          f"offset=({self.joint_offset_deg[0]:.3f},{self.joint_offset_deg[1]:.3f},{self.joint_offset_deg[2]:.3f}) "
+                          f"buf_len={len(self.data)}")
+
+                # ── Timing stats ──────────────────────────────────────────────────
+                if self.debug_timing:
+                    latency_ms = (now * 1000.0) - ts_ms   # PC_recv_ms − ESP_send_ms
+                    loop_dt_ms = (now * 1000.0) - self._timing_last_pc_s * 1000.0 if self._timing_last_pc_s else 0.0
+                    self._timing_latency.append(latency_ms)
+                    if loop_dt_ms > 0:
+                        self._timing_dts.append(loop_dt_ms)
+                    self._timing_last_pc_s = now
+                    self._timing_last_esp_ms = ts_ms
+                    # Report every ~1 second
+                    if now - self._timing_last_report >= 1.0:
+                        import statistics
+                        dts = self._timing_dts[-500:] if len(self._timing_dts) > 500 else self._timing_dts
+                        lat = self._timing_latency[-500:] if len(self._timing_latency) > 500 else self._timing_latency
+                        if dts and lat:
+                            print(f"[TWAI] Timing — loop_dt: avg={statistics.mean(dts):.2f}ms "
+                                  f"min={min(dts):.2f} max={max(dts):.2f} "
+                                  f"std={statistics.stdev(dts) if len(dts) > 1 else 0:.2f} | "
+                                  f"latency: avg={statistics.mean(lat):.2f}ms "
+                                  f"min={min(lat):.2f} max={max(lat):.2f} | "
+                                  f"n={len(dts)}")
+                        self._timing_last_report = now
 
         elif line.startswith("READY"):
             self.esp32_ready = True
             self.status_message = "ESP32 READY — có thể vào Closed Loop"
             print(f"[TWAI] {line}")
             if self.pending_closed_loop and not self.closed_loop_control:
-                print("[TWAI] READY nhận được, tự vào Closed Loop theo yêu cầu trước đó.")
+                print("[TWAI] READY nhận được, tự vào Closed Loop.")
                 self.enter_closed_loop()
 
         elif line.startswith("STATUS"):
             self.status_message = line
-            print(f"[TWAI] {line}")
+            if self.debug_serial_verbose:
+                print(f"[TWAI] {line}")
 
         elif line.startswith("WARN"):
-            self.status_message = line
-            print(f"[TWAI] {line}")
-
-        elif line.startswith("INFO"):
-            self.status_message = line
-            print(f"[TWAI] {line}")
+            if self.debug_serial_verbose:
+                print(f"[TWAI] {line}")
+            elif "feedback timeout" not in line and "RX queue full" not in line:
+                self.status_message = line
 
         elif line.startswith("ERROR"):
-            self.error = True
             self.status_message = line
-            print(f"[TWAI] {line}")
+            if self.debug_serial_verbose:
+                print(f"[TWAI] {line}")
+            if "CAN init failed" in line or "heartbeat" in line:
+                self.error = True
+
+        elif line.startswith("LP ") or line.startswith("VEL_LP "):
+            try:
+                parts = line.split()
+                fc_vel = float(parts[1])
+                fc_set = float(parts[2]) if len(parts) >= 3 else fc_vel
+                self.set_vel_lp_hz(fc_vel, fc_set)
+                print(f"[TWAI] LP: vel_hz={self._vel_lp_hz:.1f} set_hz={self._vel_set_lp_hz:.1f}")
+            except (IndexError, ValueError):
+                print("[TWAI] Usage: LP <vel_hz> [set_hz]")
+
+
+    def set_vel_lp_hz(self, fc_vel_hz: float, fc_set_hz: float | None = None):
+        """Thay đổi corner frequency của LP filter tại runtime.
+
+        Args:
+            fc_vel_hz:  corner frequency cho qdot (vận tốc phản hồi thực).
+                        Giảm xuống → lọc mạnh hơn, ít rung, phản ứng chậm hơn.
+                        Tăng lên → lọc nhẹ, phản ứng nhanh hơn, có thể rung nhiều hơn.
+                        Khuyến nghị: 40-100 Hz.
+            fc_set_hz:  corner frequency cho qdot_d (feedforward từ trajectory).
+                        Mặc định = fc_vel_hz nếu không truyền.
+        """
+        self._vel_lp_hz = float(fc_vel_hz)
+        self._vel_lp_alpha = _lp_alpha_from_fc(self._vel_lp_hz, 100.0)
+        self._vel_set_lp_hz = float(fc_set_hz) if fc_set_hz is not None else self._vel_lp_hz
+        self._vel_set_lp_alpha = _lp_alpha_from_fc(self._vel_set_lp_hz, 100.0)
+        print(f"[TWAI] LP updated: vel_hz={self._vel_lp_hz:.1f} (alpha={self._vel_lp_alpha:.4f}), "
+              f"set_hz={self._vel_set_lp_hz:.1f} (alpha={self._vel_set_lp_alpha:.4f})")
 
     # ════════════════════════════════════════════════════════════════════════
     # GUI-facing control methods
@@ -670,7 +901,7 @@ class TWAIController(threading.Thread):
                 new0 = float(ctrlElms[0])
                 new1 = float(ctrlElms[1])
                 new2 = float(ctrlElms[2])
-                if getattr(self, "debug_sign_trace", False):
+                if self.debug_sign_trace:
                     print(f"[TWAI][TRACE] update_ctrlElms input target=({new0:.6f}, {new1:.6f}, {new2:.6f})")
                 for axis, new_target in enumerate((new0, new1, new2)):
                     if not self.locked_axes[axis]:
@@ -691,7 +922,7 @@ class TWAIController(threading.Thread):
                 self._last_motion_targets[0] = new0
                 self._last_motion_targets[1] = new1
                 self._last_motion_targets[2] = new2
-                if getattr(self, "debug_sign_trace", False):
+                if self.debug_sign_trace:
                     print(f"[TWAI][TRACE] update_ctrlElms pos_set=({self.pos_set[0]:.6f}, {self.pos_set[1]:.6f}, {self.pos_set[2]:.6f})")
             if len(ctrlElms) >= 9:
                 self.Kp_axes = [float(ctrlElms[3]), float(ctrlElms[4]), float(ctrlElms[5])]
@@ -710,10 +941,23 @@ class TWAIController(threading.Thread):
                 self.enc_bandwidth  = float(ctrlElms[6])
 
     def apply_gui_targets_deg(self, p0_deg: float, p1_deg: float, p2_deg: float):
-        
+        """Cập nhật mục tiêu khi RUNNING; chỉ tính lại spline khi target thực sự đổi."""
+        p0_deg = float(p0_deg)
+        p1_deg = float(p1_deg)
+        p2_deg = float(p2_deg)
         with self.data_lock:
-            if getattr(self, "debug_sign_trace", False):
+            if self.debug_sign_trace:
                 print(f"[TWAI][TRACE] apply_gui_targets_deg input=({p0_deg:.6f}, {p1_deg:.6f}, {p2_deg:.6f})")
+
+            unchanged = (
+                math.isclose(p0_deg, self._last_motion_targets[0], abs_tol=1e-6)
+                and math.isclose(p1_deg, self._last_motion_targets[1], abs_tol=1e-6)
+                and math.isclose(p2_deg, self._last_motion_targets[2], abs_tol=1e-6)
+            )
+            if unchanged and self._motion_time_active:
+                # Target không đổi: giữ đồng hồ spline, để run-loop tiếp tục qd theo thời gian.
+                return
+
             if getattr(self, "direct_setpoint_mode", False):
                 self.pos_set[0] = float(p0_deg)
                 self.pos_set[1] = float(p1_deg)
@@ -731,14 +975,14 @@ class TWAIController(threading.Thread):
                 self._last_motion_targets[0] = float(p0_deg)
                 self._last_motion_targets[1] = float(p1_deg)
                 self._last_motion_targets[2] = float(p2_deg)
-                if getattr(self, "debug_sign_trace", False):
+                if self.debug_sign_trace:
                     print(f"[TWAI][TRACE] apply_gui_targets_deg DIRECT pos_set=({self.pos_set[0]:.6f}, {self.pos_set[1]:.6f}, {self.pos_set[2]:.6f})")
             else:
                 self._set_target_state(0, float(p0_deg))
                 self._set_target_state(1, float(p1_deg))
                 self._set_target_state(2, float(p2_deg))
                 self._motion_clock_start()
-                self._refresh_traj_refs_locked(time.time())
+                self._refresh_traj_refs_locked(time.time(), trace=self.debug_sign_trace)
                 self._last_pos_set[0] = float(p0_deg)
                 self._last_pos_set[1] = float(p1_deg)
                 self._last_pos_set[2] = float(p2_deg)
@@ -746,7 +990,7 @@ class TWAIController(threading.Thread):
                 self._last_motion_targets[0] = float(p0_deg)
                 self._last_motion_targets[1] = float(p1_deg)
                 self._last_motion_targets[2] = float(p2_deg)
-                if getattr(self, "debug_sign_trace", False):
+                if self.debug_sign_trace:
                     print(f"[TWAI][TRACE] apply_gui_targets_deg pos_set=({self.pos_set[0]:.6f}, {self.pos_set[1]:.6f}, {self.pos_set[2]:.6f})")
     def update_loadParms(self, *loadParms):
         """Cập nhật load parameters từ GUI (giữ tương thích)."""
@@ -797,6 +1041,17 @@ class TWAIController(threading.Thread):
                     self._stop_event.wait(0.5)
                     continue
 
+            # ── Heartbeat check: reconnect nếu không nhận feedback > 3s ───────
+            if self.esp32_ready and (time.time() - self._last_fb_time) > 3.0:
+                print("[TWAI] WARN: mất feedback >3s, reset input buffer và thử lại...")
+                self.esp32_ready = False
+                self._last_fb_time = time.time()
+                if self.ser:
+                    try:
+                        self.ser.reset_input_buffer()
+                    except Exception:
+                        pass
+
             # ── ESTOP: không làm gì, chỉ chờ ─────────────────────────────
             if self._estop_event.is_set():
                 self._stop_event.wait(0.05)
@@ -835,10 +1090,11 @@ class TWAIController(threading.Thread):
                     if arm_edge:
                         self._motion_clock_start()
 
-                    tau0 = tau1 = 0.0
+                    tau0 = tau1 = tau2 = 0.0
                     ok_done = False
+                    trace_now = self._trace_loop_due()
                     with self.data_lock:
-                        self._refresh_traj_refs_locked(now_wall)
+                        self._refresh_traj_refs_locked(now_wall, trace=trace_now)
                         p0_set = self.pos_set[0]
                         p1_set = self.pos_set[1]
                         p2_set = self.pos_set[2]
@@ -880,7 +1136,7 @@ class TWAIController(threading.Thread):
                             self.torque_set[2] = 0.0
                         elif self.use_torque_mode:
                             active_axis = getattr(self, "single_axis_test", None)
-                            self._dynamic_calculation_locked(active_axis=active_axis)
+                            self._dynamic_calculation_locked(active_axis=active_axis, trace=trace_now)
                             for axis, locked in enumerate(self.locked_axes):
                                 if locked:
                                     self.torque_set[axis] = 0.0
@@ -902,29 +1158,27 @@ class TWAIController(threading.Thread):
                         self._setpoint_dirty = False
                         self.status_message = "Motion completed"
                     elif self.use_torque_mode:
-                        tau0_joint = tau0
-                        tau1_joint = tau1
-                        tau2_joint = tau2
-                        tau0_sent = self._slew_limited_torque(0, tau0_joint)
-                        tau1_sent = self._slew_limited_torque(1, tau1_joint)
-                        tau2_sent = self._slew_limited_torque(2, tau2_joint)
-                        tau0_motor = self._joint_to_motor_torque(0, tau0_sent)
-                        tau1_motor = self._joint_to_motor_torque(1, tau1_sent)
-                        tau2_motor = self._joint_to_motor_torque(2, tau2_sent)
+                        tau0_motor = self._joint_to_motor_torque(0, tau0)
+                        tau1_motor = self._joint_to_motor_torque(1, tau1)
+                        tau2_motor = self._joint_to_motor_torque(2, tau2)
+                        tau0_sent = self._slew_limited_torque(0, tau0_motor)
+                        tau1_sent = self._slew_limited_torque(1, tau1_motor)
+                        tau2_sent = self._slew_limited_torque(2, tau2_motor)
                         self._tau_sent = (tau0_sent, tau1_sent, tau2_sent)
-                        self._send_torque(0, tau0_motor)
-                        self._send_torque(1, tau1_motor)
-                        self._send_torque(2, tau2_motor)
+                        self._send_torque(0, tau0_sent)
+                        self._send_torque(1, tau1_sent)
+                        self._send_torque(2, tau2_sent)
+                        if trace_now:
+                            print(
+                                f"[TWAI][TRACE] tau_driver sent_Nm=({tau0_sent:.4f},{tau1_sent:.4f},{tau2_sent:.4f}) "
+                                f"motor_pre_slew=({tau0_motor:.4f},{tau1_motor:.4f},{tau2_motor:.4f})"
+                            )
                         if now_wall - self._last_torque_log_ts >= 1.0:
                             print(
                                 "[TWAI] CTC torque cmd "
                                 f"tau_raw=({self._last_tau_raw[0]:.4f}, {self._last_tau_raw[1]:.4f}, {self._last_tau_raw[2]:.4f}) "
-                                f"tau_joint_cmd=({tau0_sent:.4f}, {tau1_sent:.4f}, {tau2_sent:.4f}) "
-                                f"tau_motor_cmd=({tau0_motor:.4f}, {tau1_motor:.4f}, {tau2_motor:.4f}) "
-                                f"gear=({self.gear_ratios[0]:.1f}, {self.gear_ratios[1]:.1f}, {self.gear_ratios[2]:.1f}) "
-                                f"eff=({self.motor_efficiency[0]:.2f}, {self.motor_efficiency[1]:.2f}, {self.motor_efficiency[2]:.2f}) "
-                                f"p_ref0={p0_set:.2f}, p_ref1={p1_set:.2f}, p_ref2={p2_set:.2f}, "
-                                f"err_trk0={err0:.2f}deg, err_trk1={err1:.2f}deg, err_trk2={err2:.2f}deg"
+                                f"tau_joint_cmd=({tau0:.4f}, {tau1:.4f}, {tau2:.4f}) "
+                                f"tau_motor_cmd=({tau0_sent:.4f}, {tau1_sent:.4f}, {tau2_sent:.4f}) "
                             )
                             self._last_torque_log_ts = now_wall
                     else:
