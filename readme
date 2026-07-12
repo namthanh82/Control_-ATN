@@ -1,0 +1,14 @@
+(venv_python) namthanh5555@komlab:~/Downloads/GUI/LLRR_app/scripts $ python GUI.py
+/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/mainscreen.py:48: SyntaxWarning: invalid escape sequence '\.'
+  regex = QRegExp("^[0-9]{1,3}\.[0-9]{1,2}$") ## Only accept input with format: 123.45 (up to 3 digits before "." and up to 2 digits after)
+/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/mainscreen.py:1440: SyntaxWarning: invalid escape sequence '\.'
+  regex = QRegExp("^[0-9]+\.[0-9]+$") ## real numbers
+Traceback (most recent call last):
+  File "/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/GUI.py", line 3, in <module>
+    from login import LoginScreen
+  File "/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/login.py", line 8, in <module>
+    from mainscreen import (DevMainScreen, PatientMainScreen, DoctorMainScreen)
+  File "/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/mainscreen.py", line 17, in <module>
+    from popups import (AccountManagerDialog,SessionDialog,ReportDialog,AccountDialog,SetAngleDialog,SetSineDialog)
+  File "/home/namthanh5555/Downloads/GUI/LLRR_app/scripts/popups.py", line 6, in <module>
+    from PyQt5.QtChart import (QBarCategoryAxis, QBarS
