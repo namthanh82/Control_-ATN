@@ -1,0 +1,19 @@
+<RCC>
+  <qresource prefix="icons">
+    <file>icons/show.png</file>
+    <file>icons/HUST_logo.png</file>
+    <file>icons/background.PNG</file>
+    <file>icons/hide.png</file>
+    <file>icons/KomLab.png</file>
+    <file>icons/HUST.png</file>
+    <file>icons/angle_hip.png</file>
+    <file>icons/angle_knee.png</file>
+    <file>icons/angle_ankle.png</file>
+    <file>icons/Logo.png</file>
+    <file>icons/sine_hip.png</file>
+    <file>icons/sine_knee.png</file>
+    <file>icons/sine_ankle.png</file>
+    <file>icons/bike.png</file>
+  </qresource>
+  <qresource/>
+</RCC>
