@@ -1,0 +1,15 @@
+Thông tin buổi tập:
+Tên buổi tập: KTV0_session00_2024-06-28
+Ngày: 2024-06-28	Thời gian: 16:40:23 đến 16:44:04
+Bệnh nhân: HXT	ID: KTV0
+Bác sỹ: HXT	ID: KTV0
+
+Nội dung buổi tập:
+Bài tập 1: Chạy hình sin khớp hông	Nội dung: biên độ 20, chu kỳ 10 giây	Số chu kỳ: 1	T.tin tải: K.lượng: 123kg, c.dài đùi: 324cm, c.dài cẳng chân: 234cm	H.số PID: P: 123, I: 1231, D: 123	Dải sai số: -10.0 độ đến 10.0 độ
+Bài tập 2: Chạy hình sin khớp đầu gối	Nội dung: biên độ 30, chu kỳ 10 giây	Số chu kỳ: 1	T.tin tải: K.lượng: 123kg, c.dài đùi: 324cm, c.dài cẳng chân: 234cm	H.số PID: P: 123, I: 1231, D: 123	Dải sai số: -10.0 độ đến 10.0 độ
+Bài tập 3: Chạy hình sin khớp cổ chân	Nội dung: biên độ 18, chu kỳ 10 giây	Số chu kỳ: 1	T.tin tải: K.lượng: 123kg, c.dài đùi: 324cm, c.dài cẳng chân: 234cm	H.số PID: P: 123, I: 1231, D: 123	Dải sai số: -10.0 độ đến 10.0 độ
+Bài tập 4: Chạy đạp xe	Nội dung: 	Số chu kỳ: 1	T.tin tải: K.lượng: 123kg, c.dài đùi: 324cm, c.dài cẳng chân: 234cm	H.số PID: P: 123, I: 1231, D: 123	Dải sai số: khớp hông: -10.0 độ đến 10.0 độ, khớp đầu gối: -10.0 độ đến 10.0 độ, khớp cổ chân: -10.0 độ đến 10.0 độ
+
+
+Nhận xét đánh giá:
+
